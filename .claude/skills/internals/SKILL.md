@@ -38,8 +38,10 @@ Entry points: `dupcheck_internal()` (public API → isolated/exact/near DataFram
 ## PPP Performance (`utils/ppp.py`)
 
 - **CobraCoach/Bench reuse**: created once in `PPPrunStart()` and passed to every `netflowRun_single()` call — avoids ~2 s re-initialization per netflow iteration. Preserve this pattern when refactoring.
-- **Timing measurement**: set `PPP_TIMING_VERBOSE=1` (`.env.shared` or env var) to log per-stage timings via the `PPPTimer` class. Keep off in production.
+- **Timing measurement**: set `PPP_TIMING_VERBOSE=1` (`.env.shared` or env var) to log per-stage timings via the `PPPTimer` class. The `Snapshot` phase is the per-pointing result snapshot in `PPP_centers` (about 20–90 ms each since #510). Keep off in production.
 - `MAX_EXETIME` caps PPP runtime (default 1800 s; 0 = unlimited).
+- **`completion_rates()` / `_completion_curve()`** (#510): the completion curves are computed per pointing from the rows that pointing allocates only. `exptime_assign = min(exptime, single_exptime × hits)` is order-independent, so each pointing adds its delta to per-priority running sums (`np.bincount` over the allocated rows) instead of re-scanning all N targets; 22–393× faster per call, bit-identical results. It matters because `PPP_centers` pushes a result snapshot onto the queue after every fixed pointing (the tentative result shown on timeout) and recomputes the curves over all pointings so far each time; both consumers keep only the last snapshot. `tests/test_complete_ppc.py` keeps the pre-#510 closure as the `_reference` oracle; do not "improve" it. The copy inside `ppp_result_reproduce()` is still the old code (#514).
+- **`_make_obj_allo_table`** uses `mask.sum()`, not builtin `sum(mask)` over a bool array.
 
 ## Suppressing Third-Party Output (`utils/suppress_logging.py`)
 
