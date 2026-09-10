@@ -323,6 +323,187 @@ def set_observation_time(ra: float, dec: float = 0.0, offset_hour: float = 0.0) 
     return times[best_idx].isot.split(".")[0] + "Z"
 
 
+def _completion_curve(ob_code, priority, exptime, allocated, single_exptime):
+    """Compute cumulative completion curves of a target sample over a pointing list.
+
+    Pure-numpy core of `completion_rates`. The pointings must already be in
+    ``ppc_priority`` order, because the cumulative curves depend on that order.
+
+    Each pointing adds ``single_exptime`` to the assigned exposure time of the
+    targets it allocates a fiber to, clipped at the requested ``exptime``.
+    Clipping makes the final result order-independent:
+    ``assign = min(exptime, single_exptime * hits)``, where ``hits`` is the
+    number of pointings allocating the target. Only the cumulative curves
+    depend on the order, and a pointing changes the assigned time of the rows
+    it allocates only. So each pointing needs to update those rows alone and
+    add their gain to the running per-group sums, instead of re-summing all N
+    rows of the sample for every pointing.
+
+    Parameters
+    ----------
+    ob_code : array-like of str
+        Observation code of every target. Must be unique (guaranteed by
+        `validate_input`), so a code maps to exactly one row.
+    priority : array-like
+        User-defined priority of every target (integer or float).
+    exptime : array-like of float
+        Requested exposure time of every target in seconds.
+    allocated : sequence of sequence of str
+        For each pointing, in ``ppc_priority`` order, the ``ob_code`` values it
+        allocates a fiber to. Codes that are not in `ob_code` are ignored, and
+        a code repeated within one pointing counts once.
+    single_exptime : int or float
+        Exposure time of a single pointing in seconds.
+
+    Returns
+    -------
+    assign : ndarray of float64, shape (N,)
+        Assigned exposure time per target, ``min(exptime, single_exptime * hits)``.
+    fh : ndarray of float64, shape (P, G + 1)
+        Cumulative achieved fiber hours after each pointing, column 0 for the
+        whole sample and columns 1..G for the priority groups in `sub_l` order.
+    fh_pct : ndarray of float64, shape (P, G + 1)
+        `fh` as a percentage of the requested fiber hours.
+    n : ndarray of int64, shape (P, G + 1)
+        Cumulative number of completed targets (``exptime <= assign``) after
+        each pointing, same column layout as `fh`.
+    n_pct : ndarray of float64, shape (P, G + 1)
+        `n` as a percentage of the target counts.
+    sub_l : list
+        Sorted unique priorities, one per group.
+    """
+    ob_code = np.asarray(ob_code)
+    priority = np.asarray(priority)
+    exptime = np.asarray(exptime, dtype=float)
+    n_target = len(exptime)
+
+    # Same result as before #510: a sorted list of numpy scalars (downstream
+    # code does int(ii) on the elements and compares the lists).
+    sub_l = sorted(set(priority))
+    n_sub = len(sub_l)
+
+    # priority -> group code 1..n_sub. Column 0 of every curve is the whole
+    # sample, so the codes are shifted by one and np.bincount()[1:] yields all
+    # per-group values in a single pass. The lookup is exact because sub_l is
+    # derived from the same array.
+    code = np.searchsorted(np.asarray(sub_l), priority) + 1
+    row_of = {c: i for i, c in enumerate(ob_code)}
+
+    # Requested totals, used as the denominators of the percentages.
+    total_fh = np.zeros(n_sub + 1)
+    total_fh[0] = exptime.sum()
+    total_fh[1:] = np.bincount(code, weights=exptime, minlength=n_sub + 1)[1:]
+    total_fh /= 3600.0
+    total_n = np.zeros(n_sub + 1, dtype=np.int64)
+    total_n[0] = n_target
+    total_n[1:] = np.bincount(code, minlength=n_sub + 1)[1:]
+
+    assign = np.zeros(n_target, dtype=float)
+    # A target requesting no exposure time is complete from the start, which is
+    # what the "exptime <= exptime_assign" test did before #510.
+    done = exptime <= assign
+
+    # Running sums, updated per pointing from the allocated rows only.
+    cur_fh = np.zeros(n_sub + 1)
+    cur_n = np.zeros(n_sub + 1, dtype=np.int64)
+    cur_n[0] = done.sum()
+    cur_n[1:] = np.bincount(code[done], minlength=n_sub + 1)[1:]
+
+    n_point = len(allocated)
+    fh = np.empty((n_point, n_sub + 1), dtype=float)
+    n = np.empty((n_point, n_sub + 1), dtype=np.int64)
+
+    for k, codes in enumerate(allocated):
+        idx = np.fromiter(
+            (row_of[c] for c in codes if c in row_of), dtype=np.intp, count=-1
+        )
+        if idx.size > 0:
+            idx = np.unique(idx)  # one hit per row per pointing, as np.isin did
+            old = assign[idx]
+            new = np.minimum(old + single_exptime, exptime[idx])
+            assign[idx] = new
+            gained = new - old
+            group = code[idx]
+            cur_fh[0] += gained.sum()
+            cur_fh[1:] += np.bincount(group, weights=gained, minlength=n_sub + 1)[1:]
+            newly = (~done[idx]) & (exptime[idx] <= new)
+            if newly.any():
+                done[idx[newly]] = True
+                cur_n[0] += newly.sum()
+                cur_n[1:] += np.bincount(group[newly], minlength=n_sub + 1)[1:]
+        # A pointing with an empty (or fully unknown) allocation still emits a
+        # row; the cumulative values simply repeat.
+        fh[k] = cur_fh / 3600.0
+        n[k] = cur_n
+
+    return assign, fh, fh / total_fh * 100, n, n / total_n * 100, sub_l
+
+
+def completion_rates(sample, point_l, single_exptime, logger=None):
+    """Examine the completeness fraction of the user sample.
+
+    Table-facing wrapper around `_completion_curve`. `sample` is modified in
+    place (callers reuse the input table) and returned as the first element.
+
+    Parameters
+    ----------
+    sample : astropy.table.Table
+        User sample with ``ob_code``, ``priority`` and ``exptime`` columns. The
+        ``exptime_assign`` column is added or overwritten in place, in seconds.
+    point_l : astropy.table.Table
+        Pointing information with ``ppc_priority`` and ``allocated_targets``
+        columns. May be empty.
+    single_exptime : int or float
+        Exposure time of a single pointing in seconds.
+    logger : loguru.Logger, optional
+        Used only to report an empty `point_l`.
+
+    Returns
+    -------
+    sample : astropy.table.Table
+        The input table itself, with ``exptime_assign`` filled in.
+    fh, fh_pct, n, n_pct : ndarray
+        Cumulative fiber hours, achieved fiber-hour percentage, completed
+        target counts and completed-count percentage after each pointing,
+        column 0 for the whole sample and columns 1.. per priority group. See
+        `_completion_curve`.
+    sub_l : list
+        Sorted unique priorities, one per group.
+    """
+    if len(point_l) == 0:
+        # Before #510 the column was set to a scalar 0 above this branch, so an
+        # empty pointing list leaves an integer column; keep that, and keep the
+        # four curve arrays distinct objects.
+        sub_l = sorted(set(sample["priority"]))
+        n_sub = len(sub_l)
+        sample["exptime_assign"] = 0
+        if logger is not None:
+            logger.info("No PPC is determined. Return zeros.")
+        return (
+            sample,
+            np.array([[0] * (n_sub + 1)]),
+            np.array([[0] * (n_sub + 1)]),
+            np.array([[0] * (n_sub + 1)]),
+            np.array([[0] * (n_sub + 1)]),
+            sub_l,
+        )
+
+    # sort ppc by its total priority == sum(weights of the assigned targets in ppc)
+    order = point_l.argsort(keys="ppc_priority")
+
+    assign, fh, fh_pct, n, n_pct, sub_l = _completion_curve(
+        sample["ob_code"],
+        sample["priority"],
+        sample["exptime"],
+        point_l["allocated_targets"][order],
+        single_exptime,
+    )
+
+    sample["exptime_assign"] = assign
+
+    return sample, fh, fh_pct, n, n_pct, sub_l
+
+
 def PPPrunStart(
     uS,
     uPPC,
@@ -728,7 +909,7 @@ def PPPrunStart(
         priorities = [p[4] for p in peaks]
         masks = [p[5] for p in peaks]
         tgt_lists = [p[6] for p in peaks]
-        fiber_fracs = [sum(mask) / 2394.0 * 100.0 for mask in masks]
+        fiber_fracs = [mask.sum() / 2394.0 * 100.0 for mask in masks]
 
         tbl = Table()
         tbl["ppc_code_"] = Column(codes, dtype=np.str_)
@@ -862,6 +1043,7 @@ def PPPrunStart(
 
                 # flush every 1 peaks if queue provided
                 if queue:
+                    ppp_timer.start("Snapshot")
                     res_ = sample_f["resolution"][0]
                     sample_f.meta["PPC"] = np.array([p[:4] for p in peaks])
                     obj_table = _make_obj_allo_table(peaks, res_)
@@ -911,6 +1093,7 @@ def PPPrunStart(
                                 status,
                             ]
                         )
+                    ppp_timer.stop("Snapshot")
 
                 # decrement exposure
                 remaining["exptime_PPP"][mask_assign] -= single_exptime
@@ -1412,92 +1595,7 @@ def PPPrunStart(
         return point_t
 
     def complete_ppc(sample, point_l):
-        """examine the completeness fraction of the user sample
-
-        Parameters
-        ==========
-        sample : table
-
-        point_l: table of ppc information
-
-        Returns
-        =======
-        sample with allocated time
-
-        completion rate: in each user-defined priority + overall
-        """
-        sample["exptime_assign"] = 0
-        sub_l = sorted(list(set(sample["priority"])))
-        n_sub = len(sub_l)
-
-        if len(point_l) == 0:
-            logger.info("No PPC is determined. Return zeros.")
-            return (
-                sample,
-                np.array([[0] * (n_sub + 1)]),
-                np.array([[0] * (n_sub + 1)]),
-                np.array([[0] * (n_sub + 1)]),
-                np.array([[0] * (n_sub + 1)]),
-                sub_l,
-            )
-
-        point_l_pri = point_l[
-            point_l.argsort(keys="ppc_priority")
-        ]  # sort ppc by its total priority == sum(weights of the assigned targets in ppc)
-
-        # sub-groups of the input sample, catagarized by the user defined priority
-        count_sub_fh = [sum(sample["exptime"]) / 3600.0] + [
-            sum(sample[sample["priority"] == ll]["exptime"]) / 3600.0 for ll in sub_l
-        ]  # fiber hours
-        count_sub_n = [len(sample)] + [
-            sum(sample["priority"] == ll) for ll in sub_l
-        ]  # number count of complete targets
-
-        completeR_fh = []  # fiber hours
-        completeR_fh_ = []  # percentage
-
-        completeR_n = []  # number count of complete targets
-        completeR_n_ = []  # percentage
-
-        for ppc in point_l_pri:
-            lst = np.where(np.isin(sample["ob_code"], ppc["allocated_targets"]))[0]
-            sample["exptime_assign"].data[lst] += single_exptime
-            sample["exptime_assign"] = np.minimum(
-                sample["exptime_assign"], sample["exptime"]
-            )
-
-            # achieved fiber hours (in total, in P[0-9])
-            comT_t_fh = [sum(sample["exptime_assign"]) / 3600.0] + [
-                sum(sample[sample["priority"] == ll]["exptime_assign"]) / 3600.0
-                for ll in sub_l
-            ]
-
-            comp_s = np.where(sample["exptime"] <= sample["exptime_assign"])[0]
-            comT_t_n = [len(comp_s)] + [
-                sum(sample["priority"].data[comp_s] == ll) for ll in sub_l
-            ]
-
-            completeR_fh.append(comT_t_fh)
-            completeR_fh_.append(
-                [
-                    comT_t_fh[oo] / count_sub_fh[oo] * 100
-                    for oo in range(len(count_sub_fh))
-                ]
-            )
-
-            completeR_n.append(comT_t_n)
-            completeR_n_.append(
-                [comT_t_n[oo] / count_sub_n[oo] * 100 for oo in range(len(count_sub_n))]
-            )
-
-        return (
-            sample,
-            np.array(completeR_fh),
-            np.array(completeR_fh_),
-            np.array(completeR_n),
-            np.array(completeR_n_),
-            sub_l,
-        )
+        return completion_rates(sample, point_l, single_exptime, logger=logger)
 
     def netflow_iter(uS, obj_allo, weight_para, status, max_iter=10):
         """iterate the total procedure to re-assign fibers to targets which have not been assigned
